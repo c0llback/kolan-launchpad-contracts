@@ -27,6 +27,7 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 
 import {LaunchHook} from "./LaunchHook.sol";
+import {WindowExtension} from "./WindowExtension.sol";
 
 contract Launchpad {
     using CurrencyLibrary for Currency;
@@ -35,8 +36,8 @@ contract Launchpad {
         IPoolManager manager;
         address treasury;
         PoolKey kln;
-        uint256 supply;
-        int24 openTick;
+        uint256[] supplies;
+        int24[] openTicks;
         uint256 taxBps;
         uint256 referencePremium;
         uint256 baseWindow;
@@ -48,6 +49,7 @@ contract Launchpad {
     uint256 public constant MAX_NAME = 32;
     uint256 public constant MAX_SYMBOL = 12;
     uint256 public constant MAX_URI = 16_384;
+    uint256 public constant MAX_SUPPLIES = 8;
     uint256 internal constant CHUNK = 24_000;
     int24 internal constant TICK_SPACING = 10;
 
@@ -57,8 +59,6 @@ contract Launchpad {
     uint24 internal immutable KLN_FEE;
     int24 internal immutable KLN_TICK_SPACING;
     address public immutable KLN_HOOK;
-    uint256 public immutable SUPPLY;
-    int24 public immutable OPEN_TICK;
     uint256 public immutable TAX_BPS;
     uint256 public immutable REFERENCE_PREMIUM;
     uint256 public immutable BASE_WINDOW;
@@ -67,10 +67,14 @@ contract Launchpad {
     uint256 public immutable MAX_PREMIUM_BPS;
     address internal immutable CODE_A;
     address internal immutable CODE_B;
+    address public immutable WINDOW_EXTENSION;
 
+    uint256[] internal _supplies;
+    mapping(uint256 supply => int24 tick) public openTickOf;
     LaunchHook[] internal _hooks;
     mapping(address token => LaunchHook) public hookOf;
     mapping(address hook => uint256 blockNumber) public launchedAt;
+    mapping(address hook => uint256 supply) public supplyOf;
 
     event Launched(
         address indexed token,
@@ -85,14 +89,28 @@ contract Launchpad {
     error BadConfig();
     error BadText();
     error BadSalt();
+    error BadSupply();
 
     constructor(Config memory c) {
         if (address(c.manager) == address(0) || c.treasury == address(0)) revert BadConfig();
-        if (!c.kln.currency0.isAddressZero() || Currency.unwrap(c.kln.currency1) == address(0)) revert BadConfig();
-        if (c.supply == 0 || c.supply > type(uint96).max || c.taxBps > 500) revert BadConfig();
+        if (!c.kln.currency0.isAddressZero() || Currency.unwrap(c.kln.currency1) == address(0)) {
+            revert BadConfig();
+        }
+        if (c.taxBps > 500) revert BadConfig();
+        uint256 count = c.supplies.length;
+        if (count == 0 || count > MAX_SUPPLIES || c.openTicks.length != count) revert BadConfig();
         int24 lowest = TickMath.MIN_TICK - (TickMath.MIN_TICK % TICK_SPACING);
         int24 highest = TickMath.MAX_TICK - (TickMath.MAX_TICK % TICK_SPACING);
-        if (c.openTick <= lowest || c.openTick > highest || c.openTick % TICK_SPACING != 0) revert BadConfig();
+        for (uint256 i = 0; i < count; ++i) {
+            uint256 supply = c.supplies[i];
+            int24 tick = c.openTicks[i];
+            if (supply == 0 || supply > type(uint96).max || openTickOf[supply] != 0) revert BadConfig();
+            if (tick == 0 || tick <= lowest || tick > highest || tick % TICK_SPACING != 0) {
+                revert BadConfig();
+            }
+            openTickOf[supply] = tick;
+            _supplies.push(supply);
+        }
         if (c.referencePremium == 0 || c.baseWindow == 0 || c.minWindow == 0) revert BadConfig();
         if (c.minWindow > c.maxWindow || c.maxWindow > type(uint32).max) revert BadConfig();
         if (c.maxPremiumBps == 0 || c.maxPremiumBps > 10_000) revert BadConfig();
@@ -104,14 +122,14 @@ contract Launchpad {
         KLN_FEE = c.kln.fee;
         KLN_TICK_SPACING = c.kln.tickSpacing;
         KLN_HOOK = address(c.kln.hooks);
-        SUPPLY = c.supply;
-        OPEN_TICK = c.openTick;
         TAX_BPS = c.taxBps;
         REFERENCE_PREMIUM = c.referencePremium;
         BASE_WINDOW = c.baseWindow;
         MIN_WINDOW = c.minWindow;
         MAX_WINDOW = c.maxWindow;
         MAX_PREMIUM_BPS = c.maxPremiumBps;
+
+        WINDOW_EXTENSION = address(new WindowExtension());
 
         bytes memory code = type(LaunchHook).creationCode;
         CODE_A = _store(_slice(code, 0, CHUNK));
@@ -121,6 +139,7 @@ contract Launchpad {
     function launch(
         string calldata name,
         string calldata symbol,
+        uint256 supply,
         string calldata uri,
         uint256 buyEth,
         bytes32 salt
@@ -131,7 +150,7 @@ contract Launchpad {
             revert BadText();
         }
 
-        bytes memory init = initCode(name, symbol, msg.sender);
+        bytes memory init = initCode(name, symbol, supply, msg.sender);
         assembly ("memory-safe") {
             hook := create2(0, add(init, 0x20), mload(init), salt)
         }
@@ -142,7 +161,8 @@ contract Launchpad {
         _hooks.push(h);
         hookOf[token] = h;
         launchedAt[hook] = block.number;
-        bought = h.launch{value: msg.value}(OPEN_TICK, buyEth, msg.sender);
+        supplyOf[hook] = supply;
+        bought = h.launch{value: msg.value}(openTickOf[supply], buyEth, msg.sender);
         emit Launched(token, hook, msg.sender, name, symbol, uri, bought);
     }
 
@@ -154,11 +174,12 @@ contract Launchpad {
         }
     }
 
-    function initCode(string calldata name, string calldata symbol, address creator)
+    function initCode(string calldata name, string calldata symbol, uint256 supply, address creator)
         public
         view
         returns (bytes memory)
     {
+        if (openTickOf[supply] == 0) revert BadSupply();
         LaunchHook.Config memory c = LaunchHook.Config({
             manager: POOL_MANAGER,
             launcher: address(this),
@@ -166,24 +187,29 @@ contract Launchpad {
             treasury: TREASURY,
             name: name,
             symbol: symbol,
-            supply: SUPPLY,
+            supply: supply,
             taxBps: TAX_BPS,
             referencePremium: REFERENCE_PREMIUM,
             baseWindow: BASE_WINDOW,
             minWindow: MIN_WINDOW,
             maxWindow: MAX_WINDOW,
             maxPremiumBps: MAX_PREMIUM_BPS,
-            kln: kln()
+            kln: kln(),
+            extension: WINDOW_EXTENSION
         });
         return bytes.concat(_read(CODE_A), _read(CODE_B), abi.encode(c));
     }
 
-    function initCodeHash(string calldata name, string calldata symbol, address creator)
+    function initCodeHash(string calldata name, string calldata symbol, uint256 supply, address creator)
         external
         view
         returns (bytes32)
     {
-        return keccak256(initCode(name, symbol, creator));
+        return keccak256(initCode(name, symbol, supply, creator));
+    }
+
+    function supplies() external view returns (uint256[] memory) {
+        return _supplies;
     }
 
     function kln() public view returns (PoolKey memory) {

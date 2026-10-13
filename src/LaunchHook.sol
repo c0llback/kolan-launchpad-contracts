@@ -63,6 +63,7 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
         uint256 maxWindow;
         uint256 maxPremiumBps;
         PoolKey kln;
+        address extension;
     }
 
     struct Window {
@@ -118,6 +119,7 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
     uint24 internal immutable KLN_FEE;
     int24 internal immutable KLN_TICK_SPACING;
     address internal immutable KLN_HOOKS;
+    address public immutable EXTENSION;
 
     bool public launched;
     int24 public openTick;
@@ -145,6 +147,7 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
     event WindowClosed(
         uint256 indexed id, address indexed owner, bool kept, bool backInPlace, uint256 burned
     );
+    event WindowExtended(uint256 indexed id, uint256 premium, uint256 expiry);
     event KlnBurned(uint256 indexed id, uint256 amount);
 
     error NotPoolManager();
@@ -170,6 +173,7 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
     error NotOwner();
     error WindowExpired();
     error WindowStillOpen();
+    error AlreadyLongest();
     error Insolvent();
 
     modifier onlyPoolManager() {
@@ -192,6 +196,7 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
         if (c.supply > type(uint96).max) revert BadConfig();
         if (c.maxWindow * c.referencePremium / c.baseWindow >= type(uint64).max) revert BadConfig();
         if (!c.kln.currency0.isAddressZero() || Currency.unwrap(c.kln.currency1) == address(0)) revert BadConfig();
+        if (c.extension.code.length == 0) revert BadConfig();
 
         LAUNCHER = c.launcher;
         DEV = c.dev;
@@ -206,6 +211,7 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
         KLN_FEE = c.kln.fee;
         KLN_TICK_SPACING = c.kln.tickSpacing;
         KLN_HOOKS = address(c.kln.hooks);
+        EXTENSION = c.extension;
 
         KolanToken token = new KolanToken(c.name, c.symbol, c.supply);
         TOKEN = token;
@@ -332,6 +338,18 @@ contract LaunchHook is IUnlockCallback, LiquidityBook, ReentrancyGuardTransient 
         _close(id, w, true);
         if (!TOKEN.transfer(w.owner, w.tokens)) revert TransferFailed();
         _checkSolvent();
+    }
+
+    function extend(uint256) external payable returns (uint256) {
+        address extension = EXTENSION;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            calldatacopy(ptr, 0, calldatasize())
+            let ok := delegatecall(gas(), extension, ptr, calldatasize(), 0, 0)
+            returndatacopy(ptr, 0, returndatasize())
+            if iszero(ok) { revert(ptr, returndatasize()) }
+            return(ptr, returndatasize())
+        }
     }
 
     function claimDev() external nonReentrant returns (uint256 amount) {
